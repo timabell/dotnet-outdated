@@ -5,7 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
-using System.Text.RegularExpressions;
+using System.Xml.Linq;
 
 namespace DotNetOutdated.Core.Services
 {
@@ -98,6 +98,19 @@ namespace DotNetOutdated.Core.Services
                 }
             }
 
+            // dotnet add package can only edit a direct <PackageReference Include> in the project
+            // file. When the version instead comes from an imported file (for example a shared
+            // Directory.Build.props) or a csproj Update override, the add fails with "Cannot edit
+            // items in imported files". Detect that up front and rewrite the declaring file directly.
+            if (!projectPath.IsCSharpFile()
+                && !ProjectHasDirectPackageInclude(projectPath, packageName)
+                && TryUpdatePackageReferenceVersionInDeclaringFile(projectPath, packageName, version))
+            {
+                return noRestore
+                    ? new RunStatus(string.Empty, string.Empty, 0)
+                    : RestoreProject(projectPath, ignoreFailedSources);
+            }
+
             string projectName = _fileSystem.Path.GetFileName(projectPath);
 
             List<string> arguments = ["add", projectName, "package", packageName, "-v", version.ToString()];
@@ -148,44 +161,69 @@ namespace DotNetOutdated.Core.Services
             return _dotNetRunner.Run(_fileSystem.Path.GetDirectoryName(projectPath), [.. arguments]);
         }
 
+        private static readonly string[] PackageReferenceElements = ["PackageReference"];
+        private static readonly string[] CentralPackageElements = ["PackageVersion", "GlobalPackageReference"];
+
         private bool TryUpdateCentralPackageVersion(string projectPath, string packageName, NuGetVersion version)
         {
-            var projectFile = _fileSystem.FileInfo.New(projectPath);
-            var directory = projectFile.Directory;
+            var directory = _fileSystem.FileInfo.New(projectPath).Directory;
 
             while (directory != null)
             {
-                var files = directory.GetFiles("*", SearchOption.TopDirectoryOnly);
-                IFileInfo cpvmFile = null;
-                foreach (var file in files)
+                var packagesProps = directory
+                    .GetFiles("*", SearchOption.TopDirectoryOnly)
+                    .FirstOrDefault(file => file.Name.Equals("Directory.Packages.props", StringComparison.OrdinalIgnoreCase));
+
+                if (packagesProps != null
+                    && TryUpdateVersionInFile(packagesProps.FullName, packageName, CentralPackageElements, version))
                 {
-                    if (file.Name.Equals("Directory.Packages.props", StringComparison.OrdinalIgnoreCase))
-                    {
-                        cpvmFile = file;
-                        break;
-                    }
+                    return true;
                 }
 
-                if (cpvmFile != null)
+                directory = directory.Parent;
+            }
+
+            return false;
+        }
+
+        // True when the project file itself carries a direct <PackageReference Include> for the
+        // package, which dotnet add package can edit. Anything else (an imported declaration, or a
+        // csproj Update override) it cannot, so the version has to be rewritten in place.
+        private bool ProjectHasDirectPackageInclude(string projectPath, string packageName) =>
+            FindVersionedElement(
+                XDocument.Parse(_fileSystem.File.ReadAllText(projectPath)),
+                packageName,
+                PackageReferenceElements,
+                "Include") != null;
+
+        private static XElement FindVersionedElement(XDocument document, string packageName, string[] elementNames, params string[] identifyingAttributes) =>
+            document.Descendants()
+                .Where(e => elementNames.Contains(e.Name.LocalName))
+                .FirstOrDefault(e => identifyingAttributes.Any(attribute => string.Equals(
+                    (string)e.Attribute(attribute),
+                    packageName,
+                    StringComparison.OrdinalIgnoreCase)));
+
+        // Targets a literal PackageReference version that dotnet add package cannot edit. A csproj
+        // Include/Update sits closest and overrides the imported declaration, so the project file is
+        // tried first; otherwise the search walks up to Directory.Build.props like
+        // TryUpdateCentralPackageVersion.
+        private bool TryUpdatePackageReferenceVersionInDeclaringFile(string projectPath, string packageName, NuGetVersion version)
+        {
+            if (TryUpdateVersionInFile(projectPath, packageName, PackageReferenceElements, version))
+            {
+                return true;
+            }
+
+            var directory = _fileSystem.FileInfo.New(projectPath).Directory;
+
+            while (directory != null)
+            {
+                foreach (var file in directory.GetFiles("*", SearchOption.TopDirectoryOnly))
                 {
-                    string fileContent;
-                    using (var reader = cpvmFile.OpenText())
+                    if (file.Name.Equals("Directory.Build.props", StringComparison.OrdinalIgnoreCase)
+                        && TryUpdateVersionInFile(file.FullName, packageName, PackageReferenceElements, version))
                     {
-                        fileContent = reader.ReadToEnd();
-                    }
-
-                    if (fileContent.Contains($"\"{packageName}\"", StringComparison.OrdinalIgnoreCase))
-                    {
-                        string newFileContent = Regex.Replace(
-                            fileContent,
-                            $"(<(?:PackageVersion|GlobalPackageReference)\\s*(?:Include|Update)=\"{Regex.Escape(packageName)}\"\\s*Version=\")([^\"]*)(\".*\\/>)",
-                            m => $"{m.Groups[1].Captures[0].Value}{version}{m.Groups[3].Captures[0].Value}");
-
-                        if (newFileContent != fileContent)
-                        {
-                            _fileSystem.File.WriteAllText(cpvmFile.FullName, newFileContent);
-                        }
-
                         return true;
                     }
                 }
@@ -194,6 +232,67 @@ namespace DotNetOutdated.Core.Services
             }
 
             return false;
+        }
+
+        private bool TryUpdateVersionInFile(string filePath, string packageName, string[] elementNames, NuGetVersion version)
+        {
+            string content = _fileSystem.File.ReadAllText(filePath);
+            var reference = FindVersionedElement(XDocument.Parse(content), packageName, elementNames, "Include", "Update");
+            string currentVersion = reference?.Attribute("Version")?.Value;
+
+            // Only literal versions belong here; an MSBuild variable ($(...)) is handled elsewhere.
+            if (string.IsNullOrEmpty(currentVersion) || currentVersion.Contains("$(", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (currentVersion != version.ToString())
+            {
+                // XDocument has confirmed the element and its literal version; swap only that value
+                // in the raw text so the file's layout is preserved. A full XDocument.Save would
+                // reserialize the whole document, collapsing multi-line PackageReference elements.
+                string updated = ReplaceVersionLiteralInElement(content, packageName, currentVersion, version.ToString());
+                if (updated == null)
+                {
+                    return false;
+                }
+
+                _fileSystem.File.WriteAllText(filePath, updated);
+            }
+
+            return true;
+        }
+
+        // Bounds the already-validated element's start tag by its name attribute (plain string
+        // search, no structural parsing) and replaces the literal version within it.
+        private static string ReplaceVersionLiteralInElement(string content, string packageName, string currentVersion, string newVersion)
+        {
+            int nameIndex = content.IndexOf($"\"{packageName}\"", StringComparison.OrdinalIgnoreCase);
+            if (nameIndex < 0)
+            {
+                nameIndex = content.IndexOf($"'{packageName}'", StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (nameIndex < 0)
+            {
+                return null;
+            }
+
+            // The nearest '<' before the name attribute opens this element; XML forbids '<' inside
+            // an attribute value, so this reliably finds the element start whatever its name.
+            int tagStart = content.LastIndexOf('<', nameIndex);
+            int tagEnd = content.IndexOf('>', nameIndex);
+            if (tagStart < 0 || tagEnd < 0)
+            {
+                return null;
+            }
+
+            string tag = content.Substring(tagStart, tagEnd - tagStart + 1);
+            string updatedTag = tag
+                .Replace($"\"{currentVersion}\"", $"\"{newVersion}\"")
+                .Replace($"'{currentVersion}'", $"'{newVersion}'");
+
+            return updatedTag == tag ? null : content.Remove(tagStart, tag.Length).Insert(tagStart, updatedTag);
         }
 
         private static RunStatus FileBasedAppUpdateFailed(string projectPath, string packageName, string hint) =>

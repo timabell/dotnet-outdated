@@ -67,6 +67,7 @@ namespace DotNetOutdated.Core.Services
                     UpdateVariable(location.Variable, options),
                 MSBuildVariableVersion location => AddWithDotNet(options, location.Variable),
                 GlobalPackageReferenceVersion location => UpdateGlobalPackageReference(location.FilePath, options),
+                PackageReferenceVersionInFile location => UpdatePackageReferenceInFile(location.FilePath, options),
                 LiteralVersion location => UpdateLiteral(location, options),
                 var location => throw new InvalidOperationException($"Unexpected version location {location}."),
             };
@@ -156,18 +157,27 @@ namespace DotNetOutdated.Core.Services
 
         // Writes a GlobalPackageReference's literal version directly: `dotnet add package` would add a PackageReference
         // instead, which central package management rejects.
-        private RunStatus UpdateGlobalPackageReference(string filePath, UpgradeOptions options)
+        private RunStatus UpdateGlobalPackageReference(string filePath, UpgradeOptions options) =>
+            UpdateLiteralVersionInFile(filePath, "GlobalPackageReference", options);
+
+        // Writes a PackageReference's literal version in the file that declares it: `dotnet add package` fails with
+        // "Cannot edit items in imported files" when that is an imported file (such as a shared Directory.Build.props)
+        // or the item is an Update. Deciding this up front avoids running it and parsing its localized error text.
+        private RunStatus UpdatePackageReferenceInFile(string filePath, UpgradeOptions options) =>
+            UpdateLiteralVersionInFile(filePath, "PackageReference", options);
+
+        private RunStatus UpdateLiteralVersionInFile(string filePath, string elementName, UpgradeOptions options)
         {
             var versionText = options.VersionRange.ToVersionString();
             var file = EncodedText.Read(_fileSystem, filePath);
             var newContent = PackageVersionMarkup.ReplaceVersion(
-                file.Content, ["GlobalPackageReference"], options.PackageName, versionText, out var matched);
+                file.Content, [elementName], options.PackageName, versionText, out var matched);
 
             if (!matched)
             {
                 return Failure(
-                    $"Could not update '{options.PackageName}' in '{filePath}': no <GlobalPackageReference> element was found " +
-                    "with an Include or Update attribute and a literal Version attribute. Update the version manually.");
+                    $"Could not update '{options.PackageName}' in '{filePath}': no <{elementName}> element was found " +
+                    "with an Include or Update attribute and a literal version (a Version attribute or <Version> child element). Update the version manually.");
             }
 
             var updated = newContent != file.Content;
@@ -226,7 +236,7 @@ namespace DotNetOutdated.Core.Services
                         // version into the project file (NuGet/Home#12552).
                         return Failure(
                             $"Could not update '{options.PackageName}' in '{centralPackagesPath}': no <PackageVersion> or <GlobalPackageReference> " +
-                            "element was found with an Include or Update attribute and a Version attribute. Update the version manually.");
+                            "element was found with an Include or Update attribute and a version (a Version attribute or <Version> child element). Update the version manually.");
                 }
             }
 
